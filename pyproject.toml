@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "usend"
+version = "1.2.0"
+description = "The official Python SDK for usend, the email API for developers."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+keywords = ["usend", "email", "transactional email", "email api", "webhooks"]
+classifiers = ["Programming Language :: Python :: 3", "Operating System :: OS Independent", "Topic :: Communications :: Email"]
+
+[project.urls]
+Homepage = "https://usend.et"
+Documentation = "https://usend.et/docs"
