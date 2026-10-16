@@ -13,4 +13,4 @@ Methods return the API's JSON as dicts and raise UsendError on failure.
 from .client import Usend, UsendError, smtp_settings, verify_webhook
 
 __all__ = ["Usend", "UsendError", "smtp_settings", "verify_webhook"]
-__version__ = "1.2.0"
+__version__ = "1.3.0"

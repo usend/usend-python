@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import time
 import urllib.error
 import urllib.parse
@@ -13,7 +14,7 @@ from typing import Any, Mapping, Optional
 
 DEFAULT_BASE_URL = "https://api.usend.et"
 DEFAULT_SMTP_HOST = "smtp.usend.et"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 Json = dict[str, Any]
 
@@ -504,12 +505,15 @@ class OAuth(_Resource):
 class Usend:
     """Client for the usend API. `base_url` defaults to USEND_BASE_URL or https://api.usend.et."""
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, timeout: float = 30.0):
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, timeout: float = 30.0, max_retries: int = 2):
         self.api_key = api_key or os.environ.get("USEND_API_KEY")
         if not self.api_key:
             raise UsendError('Missing API key. Pass it to Usend("us_...") or set USEND_API_KEY.', "missing_api_key")
         self.base_url = (base_url or os.environ.get("USEND_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
+        # Retries after the first attempt, with backoff, on 429 (honoring Retry-After), 5xx and network errors. A POST is only
+        # retried after a 5xx or network error when it carries an Idempotency-Key, so an email is never sent twice by a retry.
+        self.max_retries = max(0, int(max_retries))
         self.emails = Emails(self)
         self.batch = Batch(self)
         self.received = Received(self)
@@ -547,26 +551,49 @@ class Usend:
             h["Content-Type"] = "application/json"
         h.update(headers or {})
         req = urllib.request.Request(self.base_url + path, data=data, headers=h, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as res:
-                raw = res.read()
-                if as_ == "bytes":
-                    return raw
-                if as_ == "text":
-                    return raw.decode("utf-8", "replace")
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
+        safe = method in ("GET", "DELETE", "HEAD") or "Idempotency-Key" in h
+        attempt = 0
+        while True:
             try:
-                err = json.loads(e.read())
-            except ValueError:
-                err = {}
-            if not isinstance(err, dict):
-                err = {}
-            message = err.get("message") or err.get("error_description") or f"HTTP {e.code}"
-            raise UsendError(message, err.get("name") or err.get("error") or "application_error", e.code) from None
-        except urllib.error.URLError as e:
-            raise UsendError(str(e.reason)) from None
+                with urllib.request.urlopen(req, timeout=self.timeout) as res:
+                    raw = res.read()
+                    if as_ == "bytes":
+                        return raw
+                    if as_ == "text":
+                        return raw.decode("utf-8", "replace")
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+                code = e.code
+                wait = _retry_wait(attempt, e.headers.get("Retry-After"))
+                if attempt < self.max_retries and wait is not None and (code == 429 or (code >= 500 and safe)):
+                    attempt += 1
+                    time.sleep(wait)
+                    continue
+                try:
+                    err = json.loads(e.read())
+                except ValueError:
+                    err = {}
+                if not isinstance(err, dict):
+                    err = {}
+                message = err.get("message") or err.get("error_description") or f"HTTP {code}"
+                raise UsendError(message, err.get("name") or err.get("error") or "application_error", code) from None
+            except urllib.error.URLError as e:
+                if attempt < self.max_retries and safe:
+                    time.sleep(_retry_wait(attempt, None) or 0)
+                    attempt += 1
+                    continue
+                raise UsendError(str(e.reason)) from None
 
+
+def _retry_wait(attempt: int, retry_after: Optional[str]) -> Optional[float]:
+    """Seconds to wait before retrying, or None when the server asked for more than a minute (the error is returned instead)."""
+    if retry_after:
+        try:
+            seconds = float(retry_after)
+            return None if seconds > 60 else max(0.0, seconds)
+        except ValueError:
+            pass
+    return min(0.5 * (2 ** attempt), 8.0) + random.random() * 0.25
 
 def _idem(key: Optional[str]) -> dict:
     return {"Idempotency-Key": key} if key else {}

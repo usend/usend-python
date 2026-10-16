@@ -255,5 +255,84 @@ class NewResourcesTest(unittest.TestCase):
         self.assertEqual((q["response_type"], q["code_challenge_method"], q["state"]), (["code"], ["S256"], ["s1"]))
 
 
+class RetryTest(unittest.TestCase):
+    """A scripted server: answers with the queued (status, headers, body) tuples in order and records each request."""
+
+    def setUp(self):
+        outer = self
+        self.queue, self.calls = [], []
+
+        class H(BaseHTTPRequestHandler):
+            def _go(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                outer.calls.append((self.command, self.path))
+                status, headers, body = outer.queue.pop(0)
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = do_DELETE = _go
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.client = Usend("us_test", base_url=f"http://127.0.0.1:{self.srv.server_port}", max_retries=2)
+        import usend.client as mod
+        self._sleep, mod.time.sleep = mod.time.sleep, lambda s: None  # keep the tests fast
+        self.mod = mod
+
+    def tearDown(self):
+        self.mod.time.sleep = self._sleep
+        self.srv.shutdown()
+
+    def test_429_is_retried_for_any_request(self):
+        limited = (429, {"Retry-After": "0"}, {"statusCode": 429, "name": "rate_limit_exceeded", "message": "slow down"})
+        self.queue = [limited, (200, {}, {"id": "e1"})]
+        self.assertEqual(self.client.emails.send({"from": "a@x.com", "to": "b@y.com", "subject": "x", "text": "y"}), {"id": "e1"})
+        self.assertEqual(len(self.calls), 2)
+
+    def test_5xx_get_is_retried(self):
+        boom = (503, {}, {"statusCode": 503, "name": "internal_server_error", "message": "x"})
+        self.queue = [boom, (200, {}, {"data": []})]
+        self.assertEqual(self.client.domains.list(), {"data": []})
+        self.assertEqual(len(self.calls), 2)
+
+    def test_5xx_post_without_idempotency_key_is_not_retried(self):
+        boom = (503, {}, {"statusCode": 503, "name": "internal_server_error", "message": "x"})
+        self.queue = [boom, (200, {}, {"id": "e1"})]
+        with self.assertRaises(UsendError) as cm:
+            self.client.emails.send({"from": "a@x.com", "to": "b@y.com", "subject": "x", "text": "y"})
+        self.assertEqual(cm.exception.status_code, 503)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_5xx_post_with_idempotency_key_is_retried(self):
+        boom = (503, {}, {"statusCode": 503, "name": "internal_server_error", "message": "x"})
+        self.queue = [boom, (200, {}, {"id": "e1"})]
+        res = self.client.emails.send({"from": "a@x.com", "to": "b@y.com", "subject": "x", "text": "y"}, idempotency_key="k1")
+        self.assertEqual(res, {"id": "e1"})
+        self.assertEqual(len(self.calls), 2)
+
+    def test_gives_up_after_max_retries_and_never_waits_over_a_minute(self):
+        limited = (429, {"Retry-After": "0"}, {"statusCode": 429, "name": "rate_limit_exceeded", "message": "slow"})
+        self.queue = [limited, limited, limited, (200, {}, {})]
+        with self.assertRaises(UsendError) as cm:
+            self.client.domains.list()
+        self.assertEqual(cm.exception.status_code, 429)
+        self.assertEqual(len(self.calls), 3)  # the first try and two retries
+        self.queue = [(429, {"Retry-After": "120"}, {"statusCode": 429, "name": "rate_limit_exceeded", "message": "slow"})]
+        self.calls.clear()
+        with self.assertRaises(UsendError):
+            self.client.domains.list()
+        self.assertEqual(len(self.calls), 1)  # a two-minute wait is returned as the error, not slept
+
+
 if __name__ == "__main__":
     unittest.main()

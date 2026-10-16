@@ -25,6 +25,8 @@ Methods return the API's JSON as dicts and raise `usend.UsendError` (`status_cod
 
 - Python 3.9 or newer. No dependencies.
 - The key defaults to `USEND_API_KEY`; the base URL to `USEND_BASE_URL` or `https://api.usend.et`.
+- Requests are retried (`max_retries`, default 2) with backoff on `429` (honoring `Retry-After`), `5xx` and network errors. A `POST` is only retried after a
+  `5xx` or network error when it carries an `idempotency_key`, so an email is never sent twice by a retry.
 - `smtp_settings(key)` / `usend.smtp_settings()` return SMTP settings (host `smtp.usend.et`, port 465 or 587).
 - Resources: `emails` (incl. `metrics`, `share`, `test`, `insights`), `batch`, `received`, `templates` (+ versions),
   `domains` (+ claims, `insights`), `api_keys`, `audiences`, `segments`, `contacts` (+ imports, topics),
